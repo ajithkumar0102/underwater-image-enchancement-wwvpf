@@ -1,121 +1,88 @@
 import cv2
 import numpy as np
 import pywt
-import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
 
-# -----------------------------------
-# Step 1: Load Image
-# -----------------------------------
+# -------------------------------------------------------
+# 1️⃣  Minimal CNN Model (acts as placeholder)
+# -------------------------------------------------------
+class TinyEnhancer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 3, 3, padding=1)
+        )
+    def forward(self, x):
+        return torch.sigmoid(self.net(x))
+
+def ai_enhance(img):
+    model = TinyEnhancer()
+    model_path = "underwater_ai_model.pth"
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location="cpu"))
+        model.eval()
+    else:
+        print("⚠️  No pretrained model found – using Day 5 fallback.")
+
+    # Pre-process
+    inp = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) / 255.0
+    inp = torch.from_numpy(inp.transpose(2,0,1)).unsqueeze(0).float()
+
+    with torch.no_grad():
+        out = model(inp).squeeze(0).permute(1,2,0).numpy()
+
+    out = np.clip(out*255,0,255).astype(np.uint8)
+    return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+
+# -------------------------------------------------------
+# 2️⃣  Classical Enhancement Fallback (Day 5 condensed)
+# -------------------------------------------------------
+def classical_enhance(img):
+    # Gray-world balance
+    b,g,r = cv2.split(img)
+    mb,mg,mr = np.mean(b),np.mean(g),np.mean(r)
+    mgm = (mb+mg+mr)/3
+    img = cv2.merge((
+        np.clip(b*mgm/mb,0,255),
+        np.clip(g*mgm/mg,0,255),
+        np.clip(r*mgm/mr,0,255)
+    )).astype(np.uint8)
+
+    # CLAHE + gamma
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l,a,b = cv2.split(lab)
+    l = cv2.createCLAHE(3.0,(8,8)).apply(l)
+    img = cv2.cvtColor(cv2.merge((l,a,b)), cv2.COLOR_LAB2BGR)
+    gamma = 1.2
+    img = np.array(255*(img/255)**(1/gamma),dtype='uint8')
+
+    # Wavelet detail
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    cA,(cH,cV,cD)=pywt.dwt2(gray,'db1')
+    d=np.clip((cH+cV+cD)*2,0,255).astype('uint8')
+    d=cv2.cvtColor(cv2.resize(d,(img.shape[1],img.shape[0])),cv2.COLOR_GRAY2BGR)
+    return cv2.addWeighted(img,0.85,d,0.15,0)
+
+# -------------------------------------------------------
+# 3️⃣  Load + Process
+# -------------------------------------------------------
+import os
 img = cv2.imread("sample_underwater.jpg")
 if img is None:
-    print("❌ Error: Image not found.")
-    exit()
+    print("Image not found"); exit()
+img = cv2.resize(img,(800,600))
 
-img = cv2.resize(img, (800, 600))
+try:
+    final_ai = ai_enhance(img)
+except Exception as e:
+    print("AI enhancement failed:", e)
+    final_ai = classical_enhance(img)
 
-# -----------------------------------
-# Step 2: Auto Gray-World Color Balance
-# -----------------------------------
-def gray_world_correction(image):
-    b, g, r = cv2.split(image)
-    mean_b, mean_g, mean_r = np.mean(b), np.mean(g), np.mean(r)
-    mean_gray = (mean_b + mean_g + mean_r) / 3
-    b = np.clip(b * (mean_gray / mean_b), 0, 255)
-    g = np.clip(g * (mean_gray / mean_g), 0, 255)
-    r = np.clip(r * (mean_gray / mean_r), 0, 255)
-    return cv2.merge((b.astype(np.uint8), g.astype(np.uint8), r.astype(np.uint8)))
-
-img_corrected = gray_world_correction(img)
-
-# -----------------------------------
-# Step 3: Underwater Haze Reduction (Dark Channel Prior)
-# -----------------------------------
-def dark_channel(image, size=15):
-    b, g, r = cv2.split(image)
-    min_img = cv2.min(cv2.min(r, g), b)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (size, size))
-    return cv2.erode(min_img, kernel)
-
-def estimate_atmosphere(image, dark):
-    h, w = image.shape[:2]
-    num_pixels = h * w // 1000
-    dark_vec = dark.reshape(h * w)
-    image_vec = image.reshape(h * w, 3)
-    indices = dark_vec.argsort()[-num_pixels:]
-    atmo = np.mean(image_vec[indices], axis=0)
-    return atmo
-
-def recover_scene(image, atmosphere, omega=0.95, t_min=0.1):
-    image = image.astype('float64')
-    dark = dark_channel(image / 255)
-    transmission = 1 - omega * dark / np.max(atmosphere)
-    transmission = cv2.max(transmission, t_min)
-    J = np.empty_like(image)
-    for i in range(3):
-        J[:, :, i] = (image[:, :, i] - atmosphere[i]) / transmission + atmosphere[i]
-    return np.clip(J, 0, 255).astype(np.uint8)
-
-dark = dark_channel(img_corrected)
-A = estimate_atmosphere(img_corrected, dark)
-dehazed_img = recover_scene(img_corrected, A)
-
-# -----------------------------------
-# Step 4: CLAHE + Gamma + Wavelet Fusion
-# -----------------------------------
-lab = cv2.cvtColor(dehazed_img, cv2.COLOR_BGR2LAB)
-l, a, b = cv2.split(lab)
-clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-l = clahe.apply(l)
-lab_clahe = cv2.merge((l, a, b))
-clahe_img = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
-
-# Adaptive Gamma correction (based on brightness)
-gray = cv2.cvtColor(clahe_img, cv2.COLOR_BGR2GRAY)
-brightness = np.mean(gray) / 255
-gamma = np.clip(1.2 + (0.4 - brightness), 0.7, 1.8)
-gamma_corrected = np.array(255 * (clahe_img / 255) ** (1 / gamma), dtype='uint8')
-
-# Wavelet Detail Enhancement
-coeffs = pywt.dwt2(cv2.cvtColor(gamma_corrected, cv2.COLOR_BGR2GRAY), 'db1')
-cA, (cH, cV, cD) = coeffs
-details = np.clip((cH + cV + cD) * 2.5, 0, 255).astype(np.uint8)
-details = cv2.resize(details, (gamma_corrected.shape[1], gamma_corrected.shape[0]))
-wavelet_merge = cv2.addWeighted(gamma_corrected, 0.8, cv2.cvtColor(details, cv2.COLOR_GRAY2BGR), 0.2, 0)
-
-# -----------------------------------
-# Step 5: Dynamic Depth-Aware Fusion
-# -----------------------------------
-depth_map = cv2.Laplacian(cv2.cvtColor(dehazed_img, cv2.COLOR_BGR2GRAY), cv2.CV_64F)
-depth_norm = cv2.normalize(np.abs(depth_map), None, 0, 1, cv2.NORM_MINMAX)
-
-# Depth controls enhancement intensity
-alpha = np.clip(0.6 + 0.4 * depth_norm.mean(), 0.6, 1.0)
-beta = np.clip(30 * (1 - depth_norm.mean()), 10, 50)
-
-fusion = cv2.convertScaleAbs(wavelet_merge, alpha=alpha, beta=beta)
-final_output = cv2.bilateralFilter(fusion, 9, 75, 75)
-
-# -----------------------------------
-# Step 6: Display and Save Results
-# -----------------------------------
-cv2.imshow("Original Underwater", img)
-cv2.imshow("Gray-World Corrected", img_corrected)
-cv2.imshow("Dehazed Image (DCP)", dehazed_img)
-cv2.imshow("Final Enhanced Output", final_output)
-
-cv2.imwrite("underwater_enhanced_day5.jpg", final_output)
-cv2.imwrite("underwater_dehazed_day5.jpg", dehazed_img)
-
-# Comparison Plot
-comparison = np.hstack((img, dehazed_img, final_output))
-cv2.imwrite("comparison_day5.jpg", comparison)
-
-plt.figure(figsize=(10,4))
-plt.title("Day 5: Color Histogram Comparison")
-plt.hist(img.ravel(), bins=256, color='gray', alpha=0.5, label='Original')
-plt.hist(final_output.ravel(), bins=256, color='blue', alpha=0.5, label='Enhanced')
-plt.legend()
-plt.show()
-
+cv2.imshow("Original", img)
+cv2.imshow("AI / Classical Enhanced", final_ai)
+cv2.imwrite("underwater_day6_ai.jpg", final_ai)
 cv2.waitKey(0)
 cv2.destroyAllWindows()
